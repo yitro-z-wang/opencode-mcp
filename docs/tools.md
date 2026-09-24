@@ -306,18 +306,16 @@ Register and validate a remote opencode connection (valid only within this proce
 Parameters:
 
 - `name` (string, **required**) — connection alias; `local` is reserved and rejected.
-- `url` (string, **required**) — e.g. `http://host:4096`.
-- `password_file` (string, optional, no default) — path to a password file; its **first line** is used (empty file = error).
-- `password_env` (string, optional, no default) — name of the environment variable holding the password (missing/empty = `[availability]` error).
-- `password` (string, optional, no default) — plaintext password (lowest priority).
+- `url` (string, **required**) — public http(s) endpoint, e.g. `https://host:4096`. Non-http(s) schemes, schemeless URLs, control characters, and hosts that are — or resolve to — loopback / private / link-local (incl. the `169.254.169.254` cloud-metadata range) / reserved / multicast / unspecified IPv4 or IPv6 addresses are rejected (including non-standard encodings the resolver accepts, e.g. `2130706433`, `0x7f.0.0.1`, `0177.0.0.1`, `127.1`, and `localhost`). For a locally run server use the `OPENCODE_URL` / `OPENCODE_PASSWORD` environment variables instead.
+- `password` (string, optional, no default) — plaintext password. It is sent in the `Authorization` header to the `url` and also remains in the MCP request stream; prefer short-lived or per-connection passwords.
 - No `server` parameter.
 
-Credential priority is **`password_file` > `password_env` > `password`**; when no source yields a value, no `Authorization` header is sent (some remotes use an empty username/password). Registration performs a creation-time hard gate: unreachable = `[availability]`; reachable but not the opencode API = `[compatibility]`; 401 = `[availability]` (wrong password); a differing version adds an `api_version_warning` instead of failing.
+Only a plaintext `password` in the call is accepted: `password_file` / `password_env` are rejected, because the caller is an LLM and a file/env read would let it exfiltrate any host file or environment variable over the network. When no `password` is given, no `Authorization` header is sent (some remotes use an empty username/password). Registration performs a creation-time hard gate: unreachable = `[availability]`; reachable but not the opencode API = `[compatibility]`; 401 = `[availability]` (wrong password); a differing version adds an `api_version_warning` instead of failing.
 
-Returns: `{ "name", "url", "local", "source", "version", "baseline", "baseline_check", "password_source", "api_version_warning"? }`. `password_source` is `file` / `env` / `plaintext` / `none`.
+Returns: `{ "name", "url", "local", "source", "version", "baseline", "baseline_check", "password_source", "api_version_warning"? }`. `password_source` is `plaintext` / `none`.
 
 ```json
-{"name": "connect_server", "arguments": {"name": "build-box", "url": "http://10.0.0.5:4096", "password_env": "OPENCODE_PASSWORD"}}
+{"name": "connect_server", "arguments": {"name": "build-box", "url": "https://build-box.example.com:4096", "password": "short-lived-per-connection-password"}}
 ```
 
 ### list_servers

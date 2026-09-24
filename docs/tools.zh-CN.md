@@ -306,18 +306,16 @@ schema/handler 说明:handler 还会读取一个 `auto_permission` 参数(默认
 参数:
 
 - `name`(string,**必填**)—— 连接别名;`local` 为保留名,会被拒绝。
-- `url`(string,**必填**)—— 例如 `http://host:4096`。
-- `password_file`(string,可选,无默认值)—— 密码文件路径;使用其**第一行**(空文件 = 报错)。
-- `password_env`(string,可选,无默认值)—— 存放密码的环境变量名(缺失/为空 = `[availability]` 错误)。
-- `password`(string,可选,无默认值)—— 明文密码(优先级最低)。
+- `url`(string,**必填**)—— 公网 http(s) 端点,例如 `https://host:4096`。非 http(s) 协议、无协议 URL、控制字符,以及字面量(或其解析结果)为回环 / 私有 / 链路本地(含 `169.254.169.254` 云元数据段)/ 保留 / 组播 / 未指定的 IPv4/IPv6 地址都会被拒绝(含解析器接受的非标准写法,如 `2130706433`、`0x7f.0.0.1`、`0177.0.0.1`、`127.1` 及 `localhost`)。本地服务器请用 `OPENCODE_URL` / `OPENCODE_PASSWORD` 环境变量。
+- `password`(string,可选,无默认值)—— 明文密码。会经 `Authorization` 头发送到 `url`,且会残留在 MCP 请求流中;建议用短期 / 每连接独立的密码。
 - 无 `server` 参数。
 
-凭据优先级为 **`password_file` > `password_env` > `password`**;当没有来源提供值时,不发送 `Authorization` 头(部分远端使用空用户名/密码)。注册会执行一次创建时的硬门禁:不可达 = `[availability]`;可达但非 opencode API = `[compatibility]`;401 = `[availability]`(密码错误);版本不一致则附加 `api_version_warning` 而非失败。
+仅接受调用内传入的明文 `password`:`password_file` / `password_env` 被拒绝,因为调用方是 LLM,文件/env 读取会使其把任意主机文件或环境变量经网络外传。未提供 `password` 时不发送 `Authorization` 头(部分远端使用空用户名/密码)。注册执行创建时硬门禁:不可达 = `[availability]`;可达但非 opencode API = `[compatibility]`;401 = `[availability]`(密码错误);版本不一致附加 `api_version_warning` 而非失败。
 
-返回:`{ "name", "url", "local", "source", "version", "baseline", "baseline_check", "password_source", "api_version_warning"? }`。`password_source` 为 `file` / `env` / `plaintext` / `none`。
+返回:`{ "name", "url", "local", "source", "version", "baseline", "baseline_check", "password_source", "api_version_warning"? }`。`password_source` 为 `plaintext` / `none`。
 
 ```json
-{"name": "connect_server", "arguments": {"name": "build-box", "url": "http://10.0.0.5:4096", "password_env": "OPENCODE_PASSWORD"}}
+{"name": "connect_server", "arguments": {"name": "build-box", "url": "https://build-box.example.com:4096", "password": "short-lived-per-connection-password"}}
 ```
 
 ### list_servers

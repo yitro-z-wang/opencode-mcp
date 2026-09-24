@@ -51,7 +51,7 @@ Or register it yourself: `opencode mcp add opencode-local -- python3 /path/to/se
 - **Authoritative state, no guessing** — terminal states come from opencode's session outcome, not message-shape heuristics.
 - **Multi-agent aware** — delegated subagents cannot be mistaken for "done", and their permission requests are surfaced (see the docs).
 - **Failure classification** — every failure is classified `[availability] / [compatibility] / [other]`, with the raw error preserved for reporting.
-- **Safe defaults** — remote `chat` defaults to manual permission approval; credentials use `file > env > plaintext` priority.
+- **Safe defaults** — remote `chat` defaults to manual permission approval; `connect_server` only accepts a plaintext password in the call (no file/env reads by the MCP caller) and rejects non-public or non-http(s) URLs.
 - **Composable primitives** — `wait_session` (pure state) and `get_messages` (incremental cursor) separate waiting from reading.
 - **Production-grade runtime** — concurrent request handling, MCP-standard cancellation, bounded waits.
 

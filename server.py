@@ -11,11 +11,13 @@ Logs go to stderr; protocol messages go to stdout.
 
 import atexit
 import base64
+import ipaddress
 import json
 import os
 import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -38,6 +40,26 @@ DEFAULT_PASSWORD = "opencode"
 
 HTTP_TIMEOUT = 30.0
 POLL_INTERVAL = 1.0
+
+# DoS bounds (a hostile endpoint or client must not be able to grow this process
+# without bound): every HTTP response read and every single stdin JSON-RPC line is
+# capped, and the worker count is clamped.
+MAX_RESPONSE_BYTES = 1024 * 1024  # 1 MiB
+MAX_STDIN_LINE = 1024 * 1024  # 1 MiB
+MAX_WORKERS = 64
+
+
+def check_response_size(size):
+    """Raise OpenCodeError for a response body beyond MAX_RESPONSE_BYTES (prevents unbounded
+    memory growth when a hostile endpoint streams a huge body)."""
+    if size > MAX_RESPONSE_BYTES:
+        raise OpenCodeError(
+            "[other] Response exceeds the %d-byte cap (declared %d bytes); the response was "
+            "rejected to protect this process (declared sizes are enforced before any read, "
+            "so a server that declares a large size but sends a small body is rejected too)"
+            % (MAX_RESPONSE_BYTES, size),
+            kind="other",
+        )
 
 VALID_AUTO_PERMISSION = ("once", "always", "reject", "manual")
 
@@ -216,6 +238,12 @@ class Connection:
         }
 
 
+def _build_opener():
+    """Opener that never follows 3xx redirects (see _NoRedirectHandler: the default
+    handler would replay the Authorization header to an unvalidated Location target)."""
+    return urllib.request.build_opener(_NoRedirectHandler)
+
+
 def _raw_probe(conn, timeout=8.0):
     """Raw GET /api/info, returns the parsed dict; network failure raises a connection exception, a non-JSON response raises ValueError."""
     req = urllib.request.Request(conn.base_url + "/api/info")
@@ -223,8 +251,15 @@ def _raw_probe(conn, timeout=8.0):
     if header:
         req.add_header("Authorization", header)
     req.add_header("Accept", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
+    with _build_opener().open(req, timeout=timeout) as resp:
+        length = resp.headers.get("Content-Length")
+        if length:
+            try:
+                check_response_size(int(length))
+            except ValueError:
+                pass
+        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+    check_response_size(len(raw))
     if not raw:
         return None
     try:
@@ -238,9 +273,13 @@ def _ensure_version(conn):
 
     Unreachable = availability; reachable but /api/info is non-JSON or returns 404/5xx = compatibility (not the opencode API);
     401 = authentication problem (wrong password).
+    A size-cap abort (OpenCodeError) is a local protection event, not a server state: it is re-raised
+    verbatim instead of being reclassified (it must not be reported as "cannot connect").
     """
     try:
         info = _raw_probe(conn)
+    except OpenCodeError:
+        raise
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             raise OpenCodeError(
@@ -296,8 +335,17 @@ def _spawn_local_serve():
         password = (
             base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
         )
-        env = dict(os.environ)
-        env["OPENCODE_SERVER_PASSWORD"] = password
+        # Minimal spawn environment (behavioral test against opencode v2.0.16, 2026-09-24:
+        # a locally spawned `opencode serve` with only PATH + HOME + OPENCODE_SERVER_PASSWORD
+        # starts, authenticates, and completes a real model turn). PATH is needed to find the
+        # opencode binary; HOME so it can read its own config; everything else (LLM / provider
+        # API keys etc.) is deliberately NOT passed, so a compromised opencode or a plugin it
+        # loads cannot read the whole host environment from its process.
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "OPENCODE_SERVER_PASSWORD": password,
+        }
         try:
             proc = subprocess.Popen(
                 ["opencode", "serve", "--port", str(port)],
@@ -368,11 +416,162 @@ def _local_connection():
         return conn
 
 
-def _register_connection(name, base_url, password):
+def _is_disallowed_ip(ip):
+    """Blocked address set: loopback / private / link-local (incl. 169.254.169.254 cloud
+    metadata) / reserved / multicast / unspecified, plus IANA special ranges that CPython's
+    ipaddress flags do not cover (100.64.0.0/10 CGNAT, 6.0.0.0/8, 7.0.0.0/8).
+
+    IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) forms are unwrapped to their
+    IPv4 address so an IPv6 literal cannot smuggle a blocked IPv4 address past the gate; pure
+    IPv4 literals get the same full predicate. Single source of truth for both the literal-IP
+    path and the resolved-hostname path."""
+    v4 = ip
+    if ip.version == 6:
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            v4 = mapped
+        elif (int(ip) >> 32) == 0:
+            # IPv4-compatible (::a.b.c.d, 0:0::/96): unroutable in practice, but unwrapped
+            # here so the blocklist can never be bypassed by an alternate literal form.
+            # int(ip) is the 128-bit value; upper 96 bits zero => low 32 bits are the IPv4.
+            v4 = ipaddress.ip_address(int(ip) & 0xFFFFFFFF)
+        else:
+            # Pure IPv6 (global unicast, ULA, multicast, ...): no IPv4 special ranges apply.
+            return (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+                or ip.is_unspecified
+            )
+    return (
+        v4.is_loopback
+        or v4.is_private
+        or v4.is_link_local
+        or v4.is_reserved
+        or v4.is_multicast
+        or v4.is_unspecified
+        or v4 in ipaddress.ip_network("100.64.0.0/10")
+        or v4 in ipaddress.ip_network("6.0.0.0/8")
+        or v4 in ipaddress.ip_network("7.0.0.0/8")
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow 3xx.
+
+    CPython's default HTTPRedirectHandler copies every request header except
+    Content-Length / Content-Type -- including Authorization: Basic *** -- to the
+    unvalidated Location target. A public attacker host that answers /api/info with
+    a 302 to http://169.254.169.254/ (or 127.0.0.1:4096) would restore the SSRF +
+    credential-injection primitive that _validate_remote_url is meant to close, on
+    every request, not just at registration. Any 3xx is a failure of the opencode
+    API contract (the API never redirects); fail closed.
+    """
+
+    def http_error_30x(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(req.full_url, code, "redirects are not followed: %s" % msg, headers, fp)
+
+    http_error_301 = http_error_302 = http_error_303 = http_error_307 = http_error_308 = http_error_30x
+
+
+def _validate_remote_url(base_url):
+    """Validate a caller-supplied remote opencode URL before any credential or request is sent to it.
+
+    A connect_server request comes from the MCP client (in production: an LLM). Without this
+    gate, a single crafted call (directly or via a prompt injection in the client's context)
+    could point this process at an attacker-controlled host and hand it the caller-supplied
+    password via the Authorization header (SSRF + credential exfiltration + internal network
+    scanning). This is the defense for that path: http/https only, an explicit host required
+    (no file://, no schemeless, no control characters), and no private / loopback / link-local
+    / reserved / cloud-metadata addresses (IPv4 + IPv6). A human who genuinely needs to connect
+    to a local server uses the documented OPENCODE_URL / OPENCODE_PASSWORD environment
+    variables, which this process's operator controls directly.
+
+    Fail-closed semantics (review 2026-09-24):
+    - IP literal: blocked when _is_disallowed_ip matches (incl. IPv6-mapped / IPv4-compatible
+      unwrapping and the CGNAT 100.64/10, 6/8, 7/8 IANA special ranges).
+    - Hostname: resolve via getaddrinfo. A pure lookup failure (no records) passes -- the
+      first real request then fails with a clean [availability] error. But when the name
+      resolves, the check is fail-closed: it blocks when ANY record is a disallowed address
+      (a mixed public+private set lets the attacker order a private record first), and also
+      when records exist but none can be parsed as an address (e.g. a scoped link-local
+      fe80::1%eth0 parses and is blocked as link-local; a record the resolver returns that
+      is not an IP at all is blocked too) -- the request would otherwise proceed to an
+      unvalidated address.
+    - Rebinding: http_request re-runs this validation before every request on a dynamic
+      connection, so a name that is public at registration but rebinds to 169.254.169.254
+      before the first request is caught at request time.
+    """
+    if not isinstance(base_url, str):
+        raise OpenCodeError("url must be a string")
+    try:
+        parts = urllib.parse.urlsplit(base_url)
+    except Exception as exc:
+        raise OpenCodeError("url %r is not a valid URL: %s" % (base_url, exc))
+    if parts.scheme not in ("http", "https"):
+        raise OpenCodeError(
+            "url scheme must be http or https (got %r); file:// and other local schemes "
+            "are not allowed for remote connections" % parts.scheme
+        )
+    if any(ord(c) < 0x20 for c in base_url):
+        raise OpenCodeError("url must not contain control characters")
+    try:
+        host = parts.hostname
+        parts.port  # forces ValueError on a malformed port
+    except ValueError as exc:
+        raise OpenCodeError("url %r is not a valid URL: %s" % (base_url, exc))
+    if not host:
+        raise OpenCodeError("url must include a host")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Hostname (not an IP literal). The system resolver (getaddrinfo) also interprets
+        # non-standard IPv4 encodings -- decimal ("2130706433"), hex ("0x7f.0.0.1"), octal
+        # ("0177.0.0.1"), short-form ("127.1") -- which ipaddress.ip_address() rejects, so
+        # resolving the name is the only way to see where such a literal actually points.
+        try:
+            records = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80))
+        except (socket.gaierror, OSError):
+            return  # unresolvable now; the first request reports [availability]
+        resolved = set()
+        for rec in records:
+            try:
+                resolved.add(ipaddress.ip_address(rec[4][0]))
+            except (ValueError, IndexError, TypeError):
+                continue
+        if any(_is_disallowed_ip(ip) for ip in resolved):
+            raise OpenCodeError(
+                "url host %r resolves to (among other records) a private / loopback / link-local / "
+                "reserved address and cannot be registered as a remote connection (connect_server is "
+                "for remote opencode servers only); use the OPENCODE_URL / OPENCODE_PASSWORD "
+                "environment variables to point this MCP at a server the operator runs locally" % host
+            )
+        if records and not resolved:
+            raise OpenCodeError(
+                "url host %r resolves to addresses that cannot be validated as public "
+                "(no parseable public A/AAAA record); refusing to connect (fail-closed); use the "
+                "OPENCODE_URL / OPENCODE_PASSWORD environment variables for a server the operator "
+                "runs locally" % host
+            )
+        return
+    if _is_disallowed_ip(ip):
+        raise OpenCodeError(
+            "url host %r is a private / loopback / link-local / reserved address and cannot "
+            "be registered as a remote connection (connect_server is for remote opencode "
+            "servers only); use the OPENCODE_URL / OPENCODE_PASSWORD environment variables to "
+            "point this MCP at a server the operator runs locally" % host
+        )
+
+
+def _register_connection(name, base_url, password, dynamic=False):
     if not name or not isinstance(name, str):
         raise OpenCodeError("Missing required parameter name")
     if name == DEFAULT_LOCAL_NAME:
         raise OpenCodeError("Connection name %r is reserved and cannot be used" % name)
+    if dynamic:
+        _validate_remote_url(base_url)
     # Fully serial: eliminates the check-then-write race in concurrent registration of the same name (registration is infrequent, so serial is fine)
     with _REGISTER_LOCK:
         with _STATE_LOCK:
@@ -521,6 +720,13 @@ def _current_request_cancelled():
 
 def http_request(conn, method, path, body=None, query=None):
     """Perform a request against the given connection; on failure classify as availability / compatibility / other (dump the raw error)."""
+    if not conn.is_local:
+        # Re-validation at request time: connect_server validated the url at registration,
+        # but a DNS name can rebind between then and now (public record -> 169.254.169.254).
+        # Re-resolving per request narrows the rebinding window to this one in-flight
+        # request without adding a network hop for the (already-validated) IP-literal case.
+        # Full elimination would require pinning the validated IP literal for the connect.
+        _validate_remote_url(conn.base_url)
     url = conn.base_url + path
     if query:
         clean = {k: v for k, v in query.items() if v is not None}
@@ -539,12 +745,31 @@ def http_request(conn, method, path, body=None, query=None):
     if data is not None:
         req.add_header("Content-Type", "application/json")
 
+    raw = b""
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            raw = resp.read()
+        with _build_opener().open(req, timeout=HTTP_TIMEOUT) as resp:
+            length = resp.headers.get("Content-Length")
+            if length:
+                try:
+                    check_response_size(int(length))
+                except ValueError:
+                    pass
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        # Outside the try on purpose: a cap abort is a local protection event and must
+        # surface as [other] verbatim -- it is not a server failure and must not be
+        # reclassified (or re-probed) by _classify_failure.
+        check_response_size(len(raw))
+    except OpenCodeError:
+        # A cap abort (declared or actual body size) raised inside the try must propagate
+        # verbatim as [other] -- it must not fall into the generic handler below, which
+        # would re-probe the endpoint and reclassify it as a server failure.
+        raise
     except urllib.error.HTTPError as exc:
         try:
-            detail = exc.read().decode("utf-8", "replace")
+            # Capped: a hostile endpoint may answer any tool call (e.g. get_messages)
+            # with a 404/5xx carrying a multi-GB body; the error body is an error detail,
+            # not the payload, so 64 KiB is far more than enough to keep.
+            detail = exc.read(65536).decode("utf-8", "replace")
         except Exception:
             detail = ""
         raise _classify_failure(
@@ -1694,7 +1919,7 @@ def tool_get_messages(args):
     session_id = args.get("session_id")
     if not session_id:
         raise OpenCodeError("Missing required parameter session_id")
-    limit = int(args.get("limit", 50) or 50)
+    limit = _limit_param(args, 50)
     after = args.get("after_message_id")
     note = None
     _route_session(session_id, conn)
@@ -1853,11 +2078,25 @@ def _session_time(raw):
     return result
 
 
+def _limit_param(args, default):
+    """Parse a caller-supplied `limit` argument: missing/None/"" -> default; non-numeric ->
+    the default (a malformed argument is a client-side mistake, not a server failure -- do
+    not surface it as an unclassified "Tool execution failed"); numeric -> clamped to 1..500."""
+    value = args.get("limit")
+    if value is None or value == "":
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, 500))
+
+
 def tool_list_sessions(args):
     conn = _resolve_connection(args)
     query = {
         "search": args.get("search"),
-        "limit": args.get("limit", 20),
+        "limit": _limit_param(args, 20),
         "order": args.get("order", "desc"),
         "directory": args.get("directory"),
         "cursor": args.get("cursor"),
@@ -1969,37 +2208,40 @@ def tool_connect_server(args):
 
     password = None
     source = None
-    password_file = args.get("password_file")
-    password_env = args.get("password_env")
-    if password_file:
-        try:
-            with open(password_file, "r", encoding="utf-8") as fh:
-                first = fh.readline().strip()
-        except Exception as exc:
-            raise OpenCodeError(
-                "[other] Failed to read password_file (%s): %s" % (password_file, exc)
-            )
-        if not first:
-            raise OpenCodeError(
-                "[other] password_file first line is empty (%s)" % password_file
-            )
-        password = first
-        source = "file"
-    if password is None and password_env:
-        password = os.environ.get(password_env)
-        if not password:
-            raise OpenCodeError(
-                "[availability] Environment variable %s is not set or is empty" % password_env,
-                kind="availability",
-            )
-        source = "env"
-    if password is None and args.get("password"):
+    # Credential sources: for an LLM-registered (dynamic) connection, only a plaintext password
+    # passed in the call itself is accepted. password_file / password_env are an LLM-directed
+    # read of arbitrary host files / environment variables, and the value is exfiltrated over
+    # the network in the Authorization header of the first request to the caller-chosen URL --
+    # a one-call credential-exfiltration primitive if a prompt injection (or a malicious
+    # client) reaches the tool. Human operators who need file/env credentials for a local
+    # server use OPENCODE_URL / OPENCODE_PASSWORD in the process environment instead.
+    if args.get("password_file"):
+        raise OpenCodeError(
+            "password_file is not accepted for dynamic remote connections: it would let the "
+            "MCP caller read any host file and exfiltrate its contents over the network. "
+            "Pass the password in the call (or use the OPENCODE_URL/OPENCODE_PASSWORD "
+            "environment for a server the operator runs)"
+        )
+    if args.get("password_env"):
+        raise OpenCodeError(
+            "password_env is not accepted for dynamic remote connections: it would let the "
+            "MCP caller read any environment variable and exfiltrate its contents over the "
+            "network. Pass the password in the call (or use the OPENCODE_URL/OPENCODE_PASSWORD "
+            "environment for a server the operator runs)"
+        )
+    if args.get("password"):
         password = args["password"]
         source = "plaintext"
 
-    conn = _register_connection(name, url, password)
+    conn = _register_connection(name, url, password, dynamic=True)
     result = conn.describe()
     result["password_source"] = source or "none"
+    if source == "plaintext":
+        result["note"] = (
+            "A plaintext password was registered in this process (it also appears in the "
+            "MCP request stream). Prefer short-lived or per-connection passwords for "
+            "dynamically connected servers."
+        )
     warning = _version_warning_for(conn)
     if warning:
         result["api_version_warning"] = warning
@@ -2372,18 +2614,24 @@ TOOLS = [
         "description": (
             "Register and validate a remote opencode connection (valid only within this process; not persisted). "
             "Connecting performs the creation-time check: unreachable = availability error; no version = compatibility error; a version differing from the baseline returns a warning. "
-            "Credential priority: password_file (first line) > password_env > plaintext password; "
-            "when all are absent, no Authorization is sent (some remotes use an empty username/password). "
+            "The url must be a public http(s) endpoint: private / loopback / link-local / reserved addresses and non-http(s) "
+            "schemes are rejected (use the OPENCODE_URL / OPENCODE_PASSWORD environment variables to point this MCP at a "
+            "server the operator runs). "
+            "Credentials: only a plaintext `password` passed in this call is accepted (it is sent in the Authorization "
+            "header to the url and also remains in the MCP request stream; prefer short-lived or per-connection passwords). "
+            "password_file / password_env are not supported for dynamic connections. "
+            "When no password is given, no Authorization is sent (some remotes use an empty username/password). "
             "Returns {name, url, version, baseline, baseline_check}."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Connection alias (handle); cannot be local"},
-                "url": {"type": "string", "description": "e.g. http://host:4096"},
-                "password_file": {"type": "string", "description": "(optional) path to a password file; its first line is used"},
-                "password_env": {"type": "string", "description": "(optional) name of the environment variable holding the password"},
-                "password": {"type": "string", "description": "(optional) plaintext password, the worst option"},
+                "url": {
+                    "type": "string",
+                    "description": "Public http(s) endpoint, e.g. https://host:4096. Private / loopback / link-local / reserved hosts and other schemes are rejected; for a locally run server use the OPENCODE_URL / OPENCODE_PASSWORD environment variables instead.",
+                },
+                "password": {"type": "string", "description": "(optional) plaintext password; it is sent to the url and also remains in the MCP request stream — prefer short-lived or per-connection passwords"},
             },
             "required": ["name", "url"],
             "additionalProperties": False,
@@ -2463,6 +2711,8 @@ def handle_message(message):
     method = message.get("method")
     msg_id = message.get("id")
     params = message.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
 
     if method == "initialize":
         requested = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
@@ -2555,14 +2805,28 @@ def _handle_request(message):
 
 def main():
     _install_signal_handlers()  # Own the spawned serve's lifetime on host-kill paths too
-    workers = max(1, int(os.environ.get("OPENCODE_MCP_WORKERS") or "4"))
+    try:
+        workers = int(os.environ.get("OPENCODE_MCP_WORKERS") or "4")
+    except ValueError:
+        workers = 4
+    workers = max(1, min(workers, MAX_WORKERS))
     log(
         "[opencode-mcp] started, workers=%d, waiting for JSON-RPC on stdin" % workers
     )
     executor = ThreadPoolExecutor(max_workers=workers)
-    # The reader thread only parses and dispatches, so cancellation notifications arrive immediately
-    for line in sys.stdin:
-        line = line.strip()
+    # The reader thread only parses and dispatches, so cancellation notifications arrive immediately.
+    # Read from sys.stdin.buffer so the line cap counts BYTES (text mode would count characters,
+    # letting a multibyte line reach several MiB in bytes before the cap triggers).
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if not raw:
+            break
+        if len(raw) > MAX_STDIN_LINE:
+            log(
+                "[opencode-mcp] stdin line exceeds %d bytes; dropping it" % MAX_STDIN_LINE
+            )
+            continue
+        line = raw.decode("utf-8", "replace").strip()
         if not line:
             continue
         try:
@@ -2583,7 +2847,8 @@ def main():
 
         # Cancellation notification: handled immediately in the reader thread, not sent to the thread pool
         if method == "notifications/cancelled":
-            cancelled_id = (message.get("params") or {}).get("requestId")
+            params = message.get("params")
+            cancelled_id = params.get("requestId") if isinstance(params, dict) else None
             if cancelled_id is not None:
                 with _STATE_LOCK:
                     _CANCELLED.add(cancelled_id)

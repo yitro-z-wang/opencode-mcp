@@ -182,11 +182,11 @@ def chat_roundtrip(client, text):
         return False
     payload = json.loads(tool_text(resp))
     print("chat status: %s" % payload.get("status"))
-    if payload.get("status") == "completed":
+    if payload.get("status") == "succeeded":
         print("assistant_text:\n%s" % payload.get("assistant_text"))
         return True
-    print("Not completed, payload:\n%s" % json.dumps(payload, ensure_ascii=False, indent=2))
-    return payload.get("status") in ("completed", "needs_permission", "needs_form")
+    print("Not succeeded, payload:\n%s" % json.dumps(payload, ensure_ascii=False, indent=2))
+    return payload.get("status") in ("succeeded", "needs_permission", "needs_form")
 
 
 def main():
